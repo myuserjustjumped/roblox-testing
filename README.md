@@ -1,2 +1,4 @@
-# roblox-testing
-using github's workflow to auto report
+# test repo
+using github's workflow to automatically report
+
+this repo will get nuked by github soon
