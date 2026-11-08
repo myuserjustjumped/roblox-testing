@@ -3,7 +3,7 @@
 > [!WARNING]
 > This repository will definitely get nuked by GitHub soon.
 
-Test repository using GitHub Actions workflows to automatically report users on Roblox.
+Test repository using GitHub Actions workflows to automatically report users on Roblox from a crawled users text file (`.txt`).
 
 ---
 
@@ -22,7 +22,7 @@ Stats across all **30 Roblox accounts**:
 
 ---
 
-## API
+## API Details
 
 Uses the following Roblox endpoint to retrieve report status tags:
 
