@@ -1,4 +1,31 @@
-# test repo
-using github's workflow to automatically report
+# Roblox Automated Report Workflow (Test Repo)
 
-this repo will get nuked by github soon
+> [!WARNING]
+> This repository will definitely get nuked by GitHub soon.
+
+Test repository using GitHub Actions workflows to automatically report users on Roblox.
+
+---
+
+## Report Results (November 8)
+
+*Note: Results were not tracked between November 3 and November 7 until November 8.*
+
+Stats across all **30 Roblox accounts**:
+
+| Metric | API Tag | Count |
+| :--- | :--- | :--- |
+| Successful | `violation` | 13,600 |
+| Rejected | `no_violation` | 409,070 |
+| Not answered yet | *(No tag)* | 83,714 |
+| **Total Reports** | — | **506,384** |
+
+---
+
+## API
+
+Uses the following Roblox endpoint to retrieve report status tags:
+
+```text
+https://usermoderation.roblox.com/v1/reports
+```
