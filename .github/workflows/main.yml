@@ -1,0 +1,156 @@
+name: Reporter
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 0 * * *'
+
+concurrency:
+  group: reporter
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Cooldown guard
+        run: |
+          if [ -f .last_run_end ]; then
+            last_end=$(cat .last_run_end)
+            now=$(date +%s)
+            target=$((last_end + 180))
+            if [ "$now" -lt "$target" ]; then
+              sleep_for=$((target - now))
+              echo "cooling down for ${sleep_for}s"
+              sleep "$sleep_for"
+            else
+              echo "cooldown satisfied"
+            fi
+          else
+            echo "first run; no cooldown needed"
+          fi
+
+      - name: Provision cookies
+        id: cookies
+        env:
+          COOKIES_FILE: ${{ secrets.COOKIES_FILE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COOKIES_FILE:-}" ]; then
+            echo "::error::COOKIES_FILE secret is not set."
+            exit 1
+          fi
+          printf '%s\n' "$COOKIES_FILE" > cookies.txt
+          sed -i '/./,$!d' cookies.txt
+          sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' cookies.txt
+          echo "wrote cookies.txt ($(wc -l < cookies.txt) lines)"
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from report import parse_cookie_line
+          with open("cookies.txt", "r", encoding="utf-8") as f:
+              lines = f.readlines()
+          parsed = []
+          for i, line in enumerate(lines, 1):
+              line = line.rstrip("\n")
+              if not line.strip() or line.lstrip().startswith("#"):
+                  continue
+              p = parse_cookie_line(line)
+              if p and p.get("value"):
+                  parsed.append(i)
+              else:
+                print(f"::warning::cookies.txt line {i} is not a recognized cookie format")
+          if not parsed:
+              print("::error::no usable cookies found in COOKIES_FILE")
+              sys.exit(2)
+          print(f"parsed {len(parsed)} cookie(s)")
+          PY
+
+      - name: Run script
+        id: run
+        env:
+          REPORT_CATEGORY_VAR: ${{ vars.REPORT_CATEGORY }}
+          REPORT_CATEGORY_SEC: ${{ secrets.REPORT_CATEGORY }}
+          REPORT_SURFACE_VAR: ${{ vars.REPORT_SURFACE }}
+          REPORT_SURFACE_SEC: ${{ secrets.REPORT_SURFACE }}
+          REPORT_COMMENT_VAR: ${{ vars.REPORT_COMMENT }}
+          REPORT_COMMENT_SEC: ${{ secrets.REPORT_COMMENT }}
+          REPORT_MAX_RUNTIME_SECONDS: '19800'
+        run: |
+          pick() {
+            local v="$1" s="$2" n="$3"
+            if [ -n "${v}" ]; then
+              export "${n}=${v}"; echo "  ${n} from repository variable"
+            elif [ -n "${s}" ]; then
+              export "${n}=${s}"; echo "  ${n} from repository secret"
+            else
+              echo "  ${n} not set; using script default"
+            fi
+          }
+          echo "configuration:"
+          pick "$REPORT_CATEGORY_VAR" "$REPORT_CATEGORY_SEC" REPORT_CATEGORY
+          pick "$REPORT_SURFACE_VAR"  "$REPORT_SURFACE_SEC"  REPORT_SURFACE
+          pick "$REPORT_COMMENT_VAR"  "$REPORT_COMMENT_SEC"  REPORT_COMMENT
+
+          set +e
+          python report.py
+          RUN_EXIT=$?
+          set -e
+          echo "python_exit=${RUN_EXIT}" >> "$GITHUB_OUTPUT"
+          echo "script exited with code ${RUN_EXIT}"
+          if [ "${RUN_EXIT}" != "0" ]; then
+            echo "::warning::report.py exited non-zero (code ${RUN_EXIT})"
+          fi
+          exit 0
+
+      - name: Commit progress
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          date +%s > .last_run_end
+          add_args=()
+          for f in reported.txt .last_run_end; do
+            if [ -e "$f" ]; then add_args+=("$f"); else echo "skipping $f (not present)"; fi
+          done
+          add_args+=(users.txt)
+          git add -- "${add_args[@]}"
+          if git diff --staged --quiet; then
+            echo "nothing to commit"
+          else
+            git commit -m "chore: checkpoint progress [skip ci]"
+            git push
+            echo "progress pushed"
+          fi
+
+      - name: Schedule next run
+        if: always() && steps.run.outcome == 'success' && steps.run.outputs.python_exit == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "waiting 3 minutes before dispatching next run"
+          sleep 180
+          gh workflow run report.yml
+          echo "next run dispatched"
