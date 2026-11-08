@@ -2,6 +2,7 @@
 
 > [!WARNING]
 > This repository will definitely get nuked by GitHub soon.
+> The code here is all made by an agentic Large Language Model (specific model i wont say.)
 
 Test repository using GitHub Actions workflows to automatically report users on Roblox from a crawled users text file (`.txt`).
 
