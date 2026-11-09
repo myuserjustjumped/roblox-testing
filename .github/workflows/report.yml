@@ -5,24 +5,30 @@ on:
   schedule:
     - cron: '30 0 * * *'
 
-concurrency:
-  group: reporter
-  cancel-in-progress: false
-
 permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: reporter-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: '1'
+  REPORT_MAX_RUNTIME_SECONDS: '17400'
+  COOLDOWN_SECONDS: '180'
+  STATE_PUSH_INTERVAL: '300'
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 350
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: true
 
       - name: Set up Python
@@ -35,25 +41,69 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Cooldown guard
+      - name: Chain gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          if [ -f .last_run_end ]; then
-            last_end=$(cat .last_run_end)
-            now=$(date +%s)
-            target=$((last_end + 180))
-            if [ "$now" -lt "$target" ]; then
-              sleep_for=$((target - now))
-              echo "cooling down for ${sleep_for}s"
-              sleep "$sleep_for"
-            else
-              echo "cooldown satisfied"
-            fi
+          set -euo pipefail
+
+          if [ "${EVENT_NAME}" != "schedule" ]; then
+            echo "event=${EVENT_NAME} -> chain gate bypassed"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          wf_file="$(basename "${GITHUB_WORKFLOW_REF%%@*}")"
+          others="$(
+            gh api -X GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf_file}/runs?per_page=30" \
+              --jq "[.workflow_runs[]
+                     | select(.id != ${RUN_ID})
+                     | select(.status == \"in_progress\"
+                           or .status == \"queued\"
+                           or .status == \"waiting\"
+                           or .status == \"pending\"
+                           or .status == \"requested\")]
+                    | length"
+          )"
+
+          if [ "${others:-0}" -gt 0 ]; then
+            echo "chain already alive (${others} run(s) in flight); scheduled start skipped"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
           else
+            echo "no chain running; scheduled start takes over"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cooldown guard
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          if [ ! -f .last_run_end ]; then
             echo "first run; no cooldown needed"
+            exit 0
+          fi
+          last_end="$(tr -dc '0-9' < .last_run_end || true)"
+          if [ -z "${last_end}" ]; then
+            echo "::warning::.last_run_end is not a unix timestamp; ignoring"
+            exit 0
+          fi
+          target=$((last_end + COOLDOWN_SECONDS))
+          now="$(date +%s)"
+          if [ "${now}" -lt "${target}" ]; then
+            sleep_for=$((target - now))
+            echo "cooling down for ${sleep_for}s"
+            sleep "${sleep_for}"
+          else
+            echo "cooldown satisfied"
           fi
 
       - name: Provision cookies
         id: cookies
+        if: steps.gate.outputs.proceed == 'true'
         env:
           COOKIES_FILE: ${{ secrets.COOKIES_FILE }}
         run: |
@@ -62,34 +112,58 @@ jobs:
             echo "::error::COOKIES_FILE secret is not set."
             exit 1
           fi
-          printf '%s\n' "$COOKIES_FILE" > cookies.txt
-          sed -i '/./,$!d' cookies.txt
-          sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' cookies.txt
+
+          umask 077
+          printf '%s' "${COOKIES_FILE}" > cookies.raw
+
+          python - <<'PY'
+          from pathlib import Path
+
+          raw = Path("cookies.raw").read_bytes()
+          text = raw.decode("utf-8-sig", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+          lines = [ln.rstrip("\n") for ln in text.split("\n")]
+          while lines and not lines[0].strip():
+              lines.pop(0)
+          while lines and not lines[-1].strip():
+              lines.pop()
+          Path("cookies.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+          rm -f cookies.raw
+          chmod 600 cookies.txt
           echo "wrote cookies.txt ($(wc -l < cookies.txt) lines)"
+
           python - <<'PY'
           import sys
+
           sys.path.insert(0, ".")
           from report import parse_cookie_line
+
+          parsed = 0
           with open("cookies.txt", "r", encoding="utf-8") as f:
-              lines = f.readlines()
-          parsed = []
-          for i, line in enumerate(lines, 1):
-              line = line.rstrip("\n")
-              if not line.strip() or line.lstrip().startswith("#"):
-                  continue
-              p = parse_cookie_line(line)
-              if p and p.get("value"):
-                  parsed.append(i)
-              else:
-                print(f"::warning::cookies.txt line {i} is not a recognized cookie format")
+              for i, line in enumerate(f, 1):
+                  line = line.rstrip("\n")
+                  if not line.strip() or line.lstrip().startswith("#"):
+                      continue
+                  try:
+                      p = parse_cookie_line(line)
+                  except Exception as exc:
+                      print(f"::warning::cookies.txt line {i} failed to parse: {exc}")
+                      continue
+                  if p and p.get("value"):
+                      parsed += 1
+                  else:
+                      print(f"::warning::cookies.txt line {i} is not a recognized cookie format")
+
           if not parsed:
               print("::error::no usable cookies found in COOKIES_FILE")
               sys.exit(2)
-          print(f"parsed {len(parsed)} cookie(s)")
+          print(f"parsed {parsed} cookie(s)")
           PY
 
       - name: Run script
         id: run
+        if: steps.gate.outputs.proceed == 'true'
+        continue-on-error: true
         env:
           REPORT_CATEGORY_VAR: ${{ vars.REPORT_CATEGORY }}
           REPORT_CATEGORY_SEC: ${{ secrets.REPORT_CATEGORY }}
@@ -97,8 +171,8 @@ jobs:
           REPORT_SURFACE_SEC: ${{ secrets.REPORT_SURFACE }}
           REPORT_COMMENT_VAR: ${{ vars.REPORT_COMMENT }}
           REPORT_COMMENT_SEC: ${{ secrets.REPORT_COMMENT }}
-          REPORT_MAX_RUNTIME_SECONDS: '19800'
         run: |
+          set -uo pipefail
           pick() {
             local v="$1" s="$2" n="$3"
             if [ -n "${v}" ]; then
@@ -113,44 +187,81 @@ jobs:
           pick "$REPORT_CATEGORY_VAR" "$REPORT_CATEGORY_SEC" REPORT_CATEGORY
           pick "$REPORT_SURFACE_VAR"  "$REPORT_SURFACE_SEC"  REPORT_SURFACE
           pick "$REPORT_COMMENT_VAR"  "$REPORT_COMMENT_SEC"  REPORT_COMMENT
+          unset REPORT_CATEGORY_VAR REPORT_CATEGORY_SEC REPORT_SURFACE_VAR \
+                REPORT_SURFACE_SEC REPORT_COMMENT_VAR REPORT_COMMENT_SEC
+
+          keeper_pid=""
+          if [ "${STATE_KEEPER:-1}" = "1" ]; then
+            (
+              while true; do
+                sleep "${STATE_PUSH_INTERVAL:-300}"
+                bash ci/commit_state.sh 2 || echo "::warning::state keeper push failed"
+              done
+            ) &
+            keeper_pid=$!
+            echo "state keeper started (every ${STATE_PUSH_INTERVAL:-300}s, pid ${keeper_pid})"
+          fi
+          stop_keeper() {
+            if [ -n "${keeper_pid}" ]; then
+              kill "${keeper_pid}" 2>/dev/null || true
+              wait "${keeper_pid}" 2>/dev/null || true
+              keeper_pid=""
+            fi
+          }
+          trap stop_keeper EXIT
+          trap 'stop_keeper; exit 143' TERM INT
 
           set +e
           python report.py
           RUN_EXIT=$?
           set -e
+          stop_keeper
+
           echo "python_exit=${RUN_EXIT}" >> "$GITHUB_OUTPUT"
           echo "script exited with code ${RUN_EXIT}"
           if [ "${RUN_EXIT}" != "0" ]; then
             echo "::warning::report.py exited non-zero (code ${RUN_EXIT})"
           fi
-          exit 0
+          exit "${RUN_EXIT}"
 
       - name: Commit progress
-        if: always()
+        if: always() && steps.gate.outputs.proceed == 'true'
+        env:
+          BRANCH: ${{ github.ref_name }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          date +%s > .last_run_end
-          add_args=()
-          for f in reported.txt .last_run_end; do
-            if [ -e "$f" ]; then add_args+=("$f"); else echo "skipping $f (not present)"; fi
-          done
-          add_args+=(users.txt)
-          git add -- "${add_args[@]}"
-          if git diff --staged --quiet; then
-            echo "nothing to commit"
+          set -uo pipefail
+          if bash ci/commit_state.sh 5 --touch-last-run; then
+            echo "state committed and pushed"
           else
-            git commit -m "chore: checkpoint progress [skip ci]"
-            git push
-            echo "progress pushed"
+            echo "::warning::final state push failed; the keeper's last push still holds the ledger"
+            exit 1
           fi
 
       - name: Schedule next run
-        if: always() && steps.run.outcome == 'success' && steps.run.outputs.python_exit == '0'
+        if: always() && steps.gate.outputs.proceed == 'true' && steps.run.outputs.python_exit == '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          echo "waiting 3 minutes before dispatching next run"
-          sleep 180
-          gh workflow run report.yml
-          echo "next run dispatched"
+          set -euo pipefail
+          wf_file="$(basename "${GITHUB_WORKFLOW_REF%%@*}")"
+
+          pending="$(
+            gh api -X GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf_file}/runs?per_page=30" \
+              --jq "[.workflow_runs[]
+                     | select(.id != ${RUN_ID})
+                     | select(.status == \"queued\"
+                           or .status == \"pending\"
+                           or .status == \"waiting\"
+                           or .status == \"requested\")]
+                    | length"
+          )"
+          if [ "${pending:-0}" -gt 0 ]; then
+            echo "a successor is already queued (${pending}); not dispatching another"
+            exit 0
+          fi
+
+          gh workflow run "${wf_file}" --ref "${BRANCH}"
+          echo "next run dispatched on ${BRANCH}"
