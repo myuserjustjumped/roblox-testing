@@ -15,14 +15,33 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-COOKIE_FILE = os.environ.get("COOKIE_FILE", "cookies.txt")
-USERS_FILE = os.environ.get("USERS_FILE", "users.txt")
-REPORTED_FILE = os.environ.get("REPORTED_FILE", "reported.txt")
+DEFAULT_COOKIE_FILE = "cookies.txt"
+DEFAULT_USERS_FILE = "users.txt"
+DEFAULT_REPORTED_FILE = "reported.txt"
+DEFAULT_ATTEMPTED_FILE = "attempted.txt"
 
-DEFAULT_MAX_RUNTIME_SECONDS = int(os.environ.get("REPORT_MAX_RUNTIME_SECONDS", "19800"))
+
+def env_path(name: str, default: str) -> str:
+    val = os.environ.get(name, "").strip()
+    return val or default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+DEFAULT_MAX_RUNTIME_SECONDS = int(os.environ.get("REPORT_MAX_RUNTIME_SECONDS", "17400"))
 REPORTS_PER_MINUTE = int(os.environ.get("REPORTS_PER_MINUTE", "6"))
-REPORT_WORKERS_MAX = int(os.environ.get("REPORT_WORKERS_MAX", "10"))
+REPORT_WORKERS_MAX = int(os.environ.get("REPORT_WORKERS_MAX", "20"))
 MAX_TARGET_RETRIES = int(os.environ.get("MAX_TARGET_RETRIES", "5"))
+MAX_RATE_LIMIT_RETRIES = int(os.environ.get("MAX_RATE_LIMIT_RETRIES", "200"))
+RETRY_NETWORK_ERRORS = _env_bool("RETRY_NETWORK_ERRORS", False)
+SKIP_ATTEMPTED = _env_bool("SKIP_ATTEMPTED", True)
+STRICT_CONFIG = _env_bool("REPORT_STRICT_CONFIG", False)
+
 REPORT_WINDOW = 60
 RATE_LIMIT_SLEEP = 60
 WORKER_POLL_INTERVAL = 1.0
@@ -30,12 +49,14 @@ NETWORK_BACKOFF_BASE = 0.25
 NETWORK_BACKOFF_MAX = 2.0
 SHUTDOWN_GRACE = 90
 REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT_CONNECT = 10
 VALIDATION_TIMEOUT = 15
 LEASE_POLL = 1.0
 EPOCH_THRESHOLD = 1_000_000_000
+STARTUP_JITTER = float(os.environ.get("REPORT_STARTUP_JITTER", "0"))
 
-AUTH_URL = "https://users.roblox.com/v1/users/authenticated"
-REPORT_URL = "https://apis.roblox.com/abuse-reporting/v1/abuse-report"
+AUTH_URL = os.environ.get("AUTH_URL", "https://users.roblox.com/v1/users/authenticated")
+REPORT_URL = os.environ.get("REPORT_URL", "https://apis.roblox.com/abuse-reporting/v1/abuse-report")
 VECTOR = "user_profile"
 ENTRY_POINT = "web"
 
@@ -187,6 +208,8 @@ class Cookie:
         self.reset_at = time.time() + REPORT_WINDOW
         self.invalid = False
         self._lock = threading.Lock()
+        self.ok_count = 0
+        self.fail_count = 0
 
     def cookie_header(self) -> str:
         with self._lock:
@@ -241,20 +264,27 @@ class Cookie:
     def apply_rate_limit(self, reset_epoch: float | None = None) -> None:
         now = time.time()
         with self._lock:
+            already_cooling = self.remaining <= 0 and self.reset_at > now
             self.remaining = 0
-            self.reset_at = reset_epoch if reset_epoch and reset_epoch > now else now + RATE_LIMIT_SLEEP
+            target = reset_epoch if reset_epoch and reset_epoch > now else now + RATE_LIMIT_SLEEP
+            self.reset_at = max(self.reset_at, target) if already_cooling else target
 
     def update_from_response(self, r: requests.Response) -> None:
         remaining = first_int(header_value(r, "x-ratelimit-remaining", "x-rate-limit-remaining"))
         reset_at = rate_limit_reset(r)
+        now = time.time()
         with self._lock:
             if remaining is not None:
                 self.remaining = min(self.remaining, max(0, remaining))
-            if reset_at is not None:
-                self.reset_at = max(reset_at, time.time())
+            if reset_at is not None and reset_at > now:
+                self.reset_at = max(self.reset_at, reset_at)
         new_value = r.cookies.get(".ROBLOSECURITY")
         if new_value:
             self.set_value(new_value.strip())
+
+
+class PoolExhausted(Exception):
+    pass
 
 
 class CookiePool:
@@ -269,6 +299,9 @@ class CookiePool:
             while True:
                 if stop_event.is_set():
                     return None
+                self._valid = [c for c in self._valid if not c.is_invalid()]
+                if not self._valid:
+                    raise PoolExhausted
                 now = time.time()
                 n = len(self._valid)
                 for _ in range(n):
@@ -276,27 +309,33 @@ class CookiePool:
                     self._rr += 1
                     if c.try_consume(now):
                         return c
-                self._valid = [c for c in self._valid if not c.is_invalid()]
-                if not self._valid:
-                    return None
                 soonest = min(c.next_reset() for c in self._valid)
                 delay = max(0.2, min(LEASE_POLL, soonest - now))
-                if stop_event.wait(timeout=delay):
-                    return None
+                if self._cond.wait(timeout=delay):
+                    pass
 
     def refill(self) -> None:
         with self._cond:
-            self._valid = [c for c in self._valid if not c.is_invalid()]
             self._cond.notify_all()
 
 
 def load_cookies(path: str) -> list[Cookie]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
     except FileNotFoundError:
         sys.exit(f"[-] {path} not found")
-    parsed = [p for p in (parse_cookie_line(l) for l in lines) if p and p["value"]]
+    parsed = []
+    for lineno, line in enumerate(lines, 1):
+        try:
+            p = parse_cookie_line(line)
+        except Exception as exc:
+            log.warning("%s:%d unparseable cookie line (%s)", path, lineno, exc)
+            continue
+        if p and p["value"]:
+            parsed.append(p)
+        elif line.strip() and not line.lstrip().startswith("#"):
+            log.warning("%s:%d line is not a recognized cookie format", path, lineno)
     if not parsed:
         sys.exit(f"[-] No usable .ROBLOSECURITY values in {path}")
     return [Cookie(p["header"], p["value"]) for p in parsed]
@@ -304,7 +343,8 @@ def load_cookies(path: str) -> list[Cookie]:
 
 def validate_cookie(cookie: Cookie) -> bool:
     try:
-        r = get_session().get(AUTH_URL, headers=base_headers(cookie.cookie_header()), timeout=VALIDATION_TIMEOUT)
+        r = get_session().get(AUTH_URL, headers=base_headers(cookie.cookie_header()),
+                              timeout=VALIDATION_TIMEOUT)
     except requests.RequestException:
         return False
     if r.status_code == 429:
@@ -336,7 +376,7 @@ def validate_all_cookies(cookies: list[Cookie]) -> list[Cookie]:
 
 def load_user_ids(path: str) -> list[int]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             raw_lines = f.readlines()
     except FileNotFoundError:
         sys.exit(f"[-] {path} not found")
@@ -356,38 +396,79 @@ def load_user_ids(path: str) -> list[int]:
     return ids
 
 
-def load_reported_ids(path: str) -> set[int]:
-    reported: set[int] = set()
+def load_id_set(path: str) -> set[int]:
+    ids: set[int] = set()
     if not os.path.exists(path):
-        return reported
-    with open(path, "r", encoding="utf-8") as f:
+        return ids
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             stripped = line.strip()
             if stripped.isascii() and stripped.isdigit():
-                reported.add(int(stripped))
-    return reported
+                ids.add(int(stripped))
+    return ids
 
 
-class ReportedLog:
-    def __init__(self, path: str) -> None:
+class IdLog:
+    def __init__(self, path: str, compact: bool = True) -> None:
         self.path = path
         self._lock = threading.Lock()
-        self._fh = open(path, "a", encoding="utf-8", buffering=1)
+        self.ids: set[int] = load_id_set(path)
+        self._wrote = 0
+        if compact:
+            self.compact()
 
-    def record(self, uid: int) -> None:
-        line = f"{uid}\n"
+    def compact(self, drop: set[int] | None = None) -> None:
         with self._lock:
-            self._fh.write(line)
-            self._fh.flush()
-            os.fsync(self._fh.fileno())
+            if drop:
+                self.ids -= drop
+            if not self.ids and not os.path.exists(self.path):
+                return
+            tmp = f"{self.path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                for uid in sorted(self.ids):
+                    f.write(f"{uid}\n")
+            os.replace(tmp, self.path)
 
-    def close(self) -> None:
+    def add(self, uid: int) -> None:
         with self._lock:
-            try:
-                self._fh.flush()
-                os.fsync(self._fh.fileno())
-            finally:
-                self._fh.close()
+            self.ids.add(uid)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(f"{uid}\n")
+                f.flush()
+                os.fsync(f.fileno())
+            self._wrote += 1
+
+    def __contains__(self, uid: int) -> bool:
+        with self._lock:
+            return uid in self.ids
+
+
+def _normalize_config(env_name: str, raw: str, table, default: str) -> tuple[str, str]:
+    raw = raw.strip()
+    if not raw:
+        return default, "default"
+    needle = raw.lower()
+    for label, api in table:
+        if needle in {api.lower(), label.lower()}:
+            return api, env_name
+    known = ", ".join(api for _l, api in table)
+    msg = f"{env_name}={raw!r} is not a known value; known values: {known}"
+    if STRICT_CONFIG:
+        sys.exit(f"[-] {msg}")
+    log.error("%s -- falling back to default %r (set REPORT_STRICT_CONFIG=1 to make this fatal)",
+              msg, default)
+    return default, f"invalid {env_name}, fell back to default"
+
+
+def resolve_config() -> tuple[str, str, str]:
+    category, cat_src = _normalize_config(
+        "REPORT_CATEGORY", os.environ.get("REPORT_CATEGORY", ""), CATEGORIES, CATEGORIES[0][1])
+    surface, surf_src = _normalize_config(
+        "REPORT_SURFACE", os.environ.get("REPORT_SURFACE", ""), SURFACES, SURFACES[0][1])
+    comment = os.environ.get("REPORT_COMMENT", "")[:1000]
+    log.info("category=%s (from %s)  surface=%s (from %s)  comment=%s",
+             category, cat_src, surface, surf_src, "set" if comment else "empty")
+    return category, surface, comment
 
 
 def submit_report(cookie: Cookie, target_id: int, category: str, surface: str, comment: str):
@@ -402,126 +483,212 @@ def submit_report(cookie: Cookie, target_id: int, category: str, surface: str, c
         "targetIdStr": str(target_id),
         "targetType": "user",
     }
+    timeout = (REQUEST_TIMEOUT_CONNECT, REQUEST_TIMEOUT)
     try:
-        r = get_session().post(REPORT_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+        r = get_session().post(REPORT_URL, json=payload, headers=headers, timeout=timeout)
+    except requests.exceptions.ConnectTimeout as e:
+        return None, e, False
+    except requests.exceptions.ConnectionError as e:
+        refused = "refused" in str(e).lower() or "resolve" in str(e).lower()
+        return None, e, not refused
     except requests.RequestException as e:
-        return None, e
+        return None, e, True
+
     if r.status_code == 403:
         token = r.headers.get("x-csrf-token")
-        if token:
+        if token and token != cookie.csrf_token:
             cookie.csrf_token = token
             headers["x-csrf-token"] = token
             try:
-                r = get_session().post(REPORT_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+                r = get_session().post(REPORT_URL, json=payload, headers=headers, timeout=timeout)
             except requests.RequestException as e:
-                return None, e
-    return r, None
+                return None, e, True
+    return r, None, True
 
 
-def requeue(target, retry_q, retry_counts, retry_lock, stats):
-    with retry_lock:
-        count = retry_counts.get(target, 0) + 1
-        if count > MAX_TARGET_RETRIES:
-            retry_counts.pop(target, None)
-            dropped = True
-        else:
-            retry_counts[target] = count
-            dropped = False
-    if dropped:
-        log.warning("dropping %s after %d failures", target, count)
-        stats.bump("dropped")
-        return False
+def is_success(status: int) -> bool:
+    return 200 <= status < 300
+
+
+def is_permanent_rejection(status: int) -> bool:
+    return status in (400, 404, 405, 409, 410, 413, 415, 422)
+
+
+class RetryBook:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.failures: dict[int, int] = {}
+        self.throttled: dict[int, int] = {}
+
+    def fail(self, target: int) -> bool:
+        with self.lock:
+            n = self.failures.get(target, 0) + 1
+            if n > MAX_TARGET_RETRIES:
+                self.failures.pop(target, None)
+                self.throttled.pop(target, None)
+                return False
+            self.failures[target] = n
+            return True
+
+    def throttle(self, target: int) -> bool:
+        with self.lock:
+            n = self.throttled.get(target, 0) + 1
+            if n > MAX_RATE_LIMIT_RETRIES:
+                self.throttled.pop(target, None)
+                return False
+            self.throttled[target] = n
+            return True
+
+    def clear(self, target: int) -> None:
+        with self.lock:
+            self.failures.pop(target, None)
+            self.throttled.pop(target, None)
+
+    def backoff(self, target: int) -> float:
+        with self.lock:
+            n = self.failures.get(target, 0)
+        return min(NETWORK_BACKOFF_MAX, NETWORK_BACKOFF_BASE * (n + 1))
+
+
+class InFlight:
+    def __init__(self) -> None:
+        self._n = 0
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> "InFlight":
+        with self._lock:
+            self._n += 1
+        return self
+
+    def __exit__(self, *exc) -> None:
+        with self._lock:
+            self._n -= 1
+
+    def count(self) -> int:
+        with self._lock:
+            return self._n
+
+
+def handle_target(
+    name, target, pool, stop_event, stats, category, surface, comment,
+    book, attempted_log, retry_q, reported_log,
+) -> None:
     try:
-        retry_q.put_nowait(target)
-    except Exception:
-        stats.bump("dropped")
-        return False
-    stats.bump("retried")
-    return True
+        cookie = pool.lease(stop_event)
+    except PoolExhausted:
+        log.error("[%s] no valid cookies left; stopping", name)
+        stop_event.set()
+        return
+    if cookie is None:
+        return
+
+    if attempted_log is not None:
+        attempted_log.add(target)
+
+    r, err, may_have_sent = submit_report(cookie, target, category, surface, comment)
+    if err is not None:
+        cookie.refund()
+        pool.refill()
+        if may_have_sent and not RETRY_NETWORK_ERRORS:
+            stats.bump("unknown_send")
+            book.clear(target)
+            log.warning("[%s] %s network error (%s); request may have been accepted, "
+                        "not retrying (at-most-once)", name, target, type(err).__name__)
+            return
+        stats.bump("network_error")
+        if stop_event.wait(timeout=book.backoff(target)):
+            return
+        if book.fail(target):
+            stats.bump("retried")
+            retry_q.put(target)
+        else:
+            stats.bump("dropped")
+            log.warning("[%s] dropping %s after repeated network errors", name, target)
+        return
+
+    cookie.update_from_response(r)
+    pool.refill()
+
+    if is_success(r.status_code):
+        cookie.ok_count += 1
+        reported_log.add(target)
+        book.clear(target)
+        stats.bump("reported")
+        log.info("[%s] reported %s (cookie=%s, HTTP %s)", name, target, cookie.id, r.status_code)
+
+    elif r.status_code == 429:
+        cookie.fail_count += 1
+        stats.bump("rate_limited")
+        cookie.apply_rate_limit(rate_limit_reset(r))
+        pool.refill()
+        if book.throttle(target):
+            stats.bump("throttled_requeue")
+            retry_q.put(target)
+        else:
+            stats.bump("dropped")
+            log.warning("[%s] dropping %s: permanently rate limited", name, target)
+
+    elif r.status_code == 401:
+        cookie.fail_count += 1
+        cookie.set_invalid()
+        pool.refill()
+        stats.bump("auth_error")
+        log.warning("[%s] 401 with cookie #%d; cookie retired", name, cookie.id)
+        if book.fail(target):
+            retry_q.put(target)
+        else:
+            stats.bump("dropped")
+
+    elif r.status_code == 403:
+        cookie.fail_count += 1
+        stats.bump("http_error")
+        log.warning("[%s] 403 on %s (cookie=%s) after CSRF refresh", name, target, cookie.id)
+        if book.fail(target):
+            retry_q.put(target)
+        else:
+            stats.bump("dropped")
+
+    elif is_permanent_rejection(r.status_code):
+        stats.bump("rejected")
+        book.clear(target)
+        log.warning("[%s] HTTP %s on %s: permanent rejection, not retrying",
+                    name, r.status_code, target)
+
+    else:
+        cookie.fail_count += 1
+        stats.bump("http_error")
+        log.warning("[%s] HTTP %s on %s", name, r.status_code, target)
+        if book.fail(target):
+            retry_q.put(target)
+        else:
+            stats.bump("dropped")
 
 
 def reporter_worker(
     name, report_q, retry_q, pool, stop_event, stats,
-    category, surface, comment, retry_counts, retry_lock,
-    reported_log, reported_set_lock, reported_set,
+    category, surface, comment, book, attempted_log, in_flight, reported_log,
 ):
-    while True:
+    while not stop_event.is_set():
         target = None
-        from_main = False
-        if not stop_event.is_set():
-            try:
-                target = retry_q.get_nowait()
-            except queue.Empty:
-                pass
-        if target is None and not stop_event.is_set():
+        try:
+            target = retry_q.get_nowait()
+        except queue.Empty:
+            pass
+        if target is None:
             try:
                 target = report_q.get(timeout=WORKER_POLL_INTERVAL)
-                from_main = True
             except queue.Empty:
-                if stop_event.is_set():
-                    return
-                continue
-        if target is None:
-            return
-
-        try:
-            cookie = pool.lease(stop_event)
-            if cookie is None:
-                stats.bump("dropped")
-                with retry_lock:
-                    retry_counts.pop(target, None)
-                continue
-            r, err = submit_report(cookie, target, category, surface, comment)
-            if err is not None:
-                log.warning("[%s] %s network error", name, target)
-                stats.bump("network_error")
-                cookie.refund()
-                pool.refill()
-                with retry_lock:
-                    count = retry_counts.get(target, 0)
-                backoff = min(NETWORK_BACKOFF_MAX, NETWORK_BACKOFF_BASE * (count + 1))
-                if stop_event.wait(timeout=backoff):
-                    with retry_lock:
-                        retry_counts.pop(target, None)
-                    break
-                requeue(target, retry_q, retry_counts, retry_lock, stats)
                 continue
 
-            cookie.update_from_response(r)
-            pool.refill()
-
-            if r.status_code == 200:
-                reported_log.record(target)
-                with reported_set_lock:
-                    reported_set.add(target)
-                with retry_lock:
-                    retry_counts.pop(target, None)
-                stats.bump("reported")
-                log.info("[%s] reported %s (cookie=%s)", name, target, cookie.id)
-            elif r.status_code == 429:
-                stats.bump("rate_limited")
-                cookie.apply_rate_limit(rate_limit_reset(r))
-                pool.refill()
-                log.warning("[%s] 429 on %s (cookie=%s), requeueing", name, target, cookie.id)
-                requeue(target, retry_q, retry_counts, retry_lock, stats)
-            elif r.status_code in (401, 403):
-                if r.status_code == 401:
-                    cookie.set_invalid()
-                    pool.refill()
-                stats.bump("http_error")
-                log.warning("[%s] auth %s on %s (cookie=%s)", name, r.status_code, target, cookie.id)
-                requeue(target, retry_q, retry_counts, retry_lock, stats)
-            else:
-                stats.bump("http_error")
-                log.warning("[%s] HTTP %s on %s", name, r.status_code, target)
-                requeue(target, retry_q, retry_counts, retry_lock, stats)
-        except Exception:
-            log.exception("[%s] unhandled error processing %s", name, target)
-            if not stop_event.is_set():
-                requeue(target, retry_q, retry_counts, retry_lock, stats)
-        finally:
-            if from_main:
-                report_q.task_done()
+        with in_flight:
+            try:
+                handle_target(name, target, pool, stop_event, stats, category,
+                              surface, comment, book, attempted_log, retry_q,
+                              reported_log)
+            except Exception:
+                log.exception("[%s] unhandled error on %s", name, target)
+                if not stop_event.is_set() and book.fail(target):
+                    retry_q.put(target)
 
 
 def deadline_watchdog(deadline: float, stop_event: threading.Event, cap_seconds: int) -> None:
@@ -535,21 +702,24 @@ def deadline_watchdog(deadline: float, stop_event: threading.Event, cap_seconds:
             return
 
 
-def resolve_config() -> tuple[str, str, str]:
-    cat_env = os.environ.get("REPORT_CATEGORY", "").strip()
-    surf_env = os.environ.get("REPORT_SURFACE", "").strip()
-    comment_env = os.environ.get("REPORT_COMMENT", "")
-    category = next((api for _label, api in CATEGORIES if api == cat_env), CATEGORIES[0][1])
-    surface = next((api for _label, api in SURFACES if api == surf_env), SURFACES[0][1])
-    comment = comment_env[:1000] if comment_env else ""
-    return category, surface, comment
+def build_pending(all_ids, reported, attempted, skip_attempted: bool) -> list[int]:
+    pending = []
+    for uid in all_ids:
+        if uid in reported:
+            continue
+        if skip_attempted and uid in attempted:
+            continue
+        pending.append(uid)
+    return pending
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Submit reports for targets listed in users.txt")
     parser.add_argument("--max-runtime", type=int, default=DEFAULT_MAX_RUNTIME_SECONDS)
     parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--force", action="store_true",
+                        help="ignore attempted.txt and re-send journalled targets")
+    args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -558,28 +728,42 @@ def main() -> int:
     )
 
     category, surface, comment = resolve_config()
-    cat_src = "REPORT_CATEGORY" if os.environ.get("REPORT_CATEGORY", "").strip() else "default"
-    surf_src = "REPORT_SURFACE" if os.environ.get("REPORT_SURFACE", "").strip() else "default"
-    comment_src = "REPORT_COMMENT" if os.environ.get("REPORT_COMMENT", "") else "default"
-    log.info("category=%s (from %s)  surface=%s (from %s)  comment=%s (from %s)",
-             category, cat_src, surface, surf_src, "set" if comment else "empty", comment_src)
 
-    cookies = load_cookies(COOKIE_FILE)
+    cookie_file = env_path("COOKIE_FILE", DEFAULT_COOKIE_FILE)
+    users_file = env_path("USERS_FILE", DEFAULT_USERS_FILE)
+    reported_file = env_path("REPORTED_FILE", DEFAULT_REPORTED_FILE)
+    attempted_file = env_path("ATTEMPTED_FILE", DEFAULT_ATTEMPTED_FILE)
+
+    cookies = load_cookies(cookie_file)
     log.info("loaded %d cookie line(s)", len(cookies))
     valid = validate_all_cookies(cookies)
     if not valid:
-        sys.exit("[-] No valid cookies remain")
+        log.error("no valid cookies remain")
+        return 3
 
-    all_ids = load_user_ids(USERS_FILE)
-    already_reported = load_reported_ids(REPORTED_FILE)
-    pending = [uid for uid in all_ids if uid not in already_reported]
+    all_ids = load_user_ids(users_file)
 
-    log.info("users.txt=%d  already_reported=%d  pending=%d",
-             len(all_ids), len(already_reported), len(pending))
+    reported_log = IdLog(reported_file)
+    attempted_log = None if args.force else IdLog(attempted_file)
+    if not SKIP_ATTEMPTED and attempted_log is not None:
+        log.warning("SKIP_ATTEMPTED=0: journalled ids will be re-sent (duplicate risk)")
+        pending = build_pending(all_ids, reported_log.ids, set(), False)
+    else:
+        attempted = attempted_log.ids if attempted_log is not None else set()
+        pending = build_pending(all_ids, reported_log.ids, attempted, True)
+        if attempted_log is not None:
+            attempted_log.compact(drop=set(reported_log.ids))
+
+    log.info("users.txt=%d  reported=%d  attempted=%d  pending=%d",
+             len(all_ids), len(reported_log.ids),
+             len(attempted_log.ids) if attempted_log else 0, len(pending))
 
     if not pending:
         log.info("no pending targets; exiting")
         return 0
+
+    if STARTUP_JITTER > 0:
+        time.sleep(STARTUP_JITTER)
 
     pool = CookiePool(valid)
     stop_event = threading.Event()
@@ -594,29 +778,23 @@ def main() -> int:
     start_mono = time.monotonic()
     deadline_mono = start_mono + args.max_runtime
 
-    reported_log = ReportedLog(REPORTED_FILE)
-    reported_set: set[int] = set(already_reported)
-    reported_set_lock = threading.Lock()
-
     report_q: queue.Queue = queue.Queue()
     retry_q: queue.Queue = queue.Queue()
-    retry_counts: dict[int, int] = {}
-    retry_lock = threading.Lock()
+    book = RetryBook()
     stats = Stats()
+    in_flight = InFlight()
 
     for uid in pending:
         report_q.put(uid)
 
-    report_workers = max(2, min(REPORT_WORKERS_MAX, len(valid)))
+    report_workers = max(2, min(REPORT_WORKERS_MAX, len(valid) * 2))
     log.info("starting %d worker(s) with %d cookie(s)", report_workers, len(valid))
     reporters = [
         threading.Thread(
             target=reporter_worker,
-            args=(
-                f"w-{i}", report_q, retry_q, pool, stop_event, stats,
-                category, surface, comment, retry_counts, retry_lock,
-                reported_log, reported_set_lock, reported_set,
-            ),
+            args=(f"w-{i}", report_q, retry_q, pool, stop_event, stats,
+                  category, surface, comment, book, attempted_log, in_flight,
+                  reported_log),
             daemon=True,
             name=f"w-{i}",
         )
@@ -628,33 +806,36 @@ def main() -> int:
     watchdog = threading.Thread(
         target=deadline_watchdog,
         args=(deadline_mono, stop_event, args.max_runtime),
-        daemon=True,
-        name="watchdog",
+        daemon=True, name="watchdog",
     )
     watchdog.start()
 
     idle_since: float | None = None
-    while True:
-        if stop_event.is_set():
-            break
-        if report_q.empty() and retry_q.empty():
+    while not stop_event.is_set():
+        busy = not report_q.empty() or not retry_q.empty() or in_flight.count() > 0
+        if busy:
+            idle_since = None
+        else:
             if idle_since is None:
                 idle_since = time.monotonic()
             elif time.monotonic() - idle_since > 2.0:
-                log.info("all queues drained; shutting down")
+                log.info("all queues drained and nothing in flight; shutting down")
                 stop_event.set()
                 break
-        else:
-            idle_since = None
-        if stop_event.wait(timeout=1.0):
+        if stop_event.wait(timeout=0.5):
             break
 
     grace_start = time.monotonic()
     for t in reporters:
         remaining = max(1.0, SHUTDOWN_GRACE - (time.monotonic() - grace_start))
+        if remaining <= 1.0:
+            break
         t.join(timeout=remaining)
 
-    reported_log.close()
+    abandoned = in_flight.count()
+    if abandoned:
+        log.warning("%d request(s) still in flight at shutdown; they are journalled "
+                    "in %s and will not be re-sent", abandoned, attempted_file)
 
     final = stats.merged()
     elapsed = time.monotonic() - start_mono
@@ -663,13 +844,26 @@ def main() -> int:
     print(f"category                : {category}")
     print(f"surface                 : {surface}")
     print(f"pending at start        : {len(pending)}")
-    print(f"reports submitted (200) : {final.get('reported', 0)}")
+    print(f"reports accepted (2xx)  : {final.get('reported', 0)}")
     print(f"rate-limit hits (429)   : {final.get('rate_limited', 0)}")
-    print(f"network errors          : {final.get('network_error', 0)}")
+    print(f"network errors (retried): {final.get('network_error', 0)}")
+    print(f"unknown send (no retry) : {final.get('unknown_send', 0)}")
+    print(f"permanent rejections    : {final.get('rejected', 0)}")
     print(f"targets retried         : {final.get('retried', 0)}")
-    print(f"auth/http errors        : {final.get('http_error', 0)}")
+    print(f"targets throttled again : {final.get('throttled_requeue', 0)}")
+    print(f"auth/http errors        : {final.get('http_error', 0)} + {final.get('auth_error', 0)} auth")
     print(f"dropped targets         : {final.get('dropped', 0)}")
     print(f"valid cookies at start  : {len(valid)}")
+    for c in valid:
+        print(f"  cookie #{c.id}: ok={c.ok_count} fail={c.fail_count}"
+              f"{' INVALID' if c.is_invalid() else ''}")
+
+    accepted = final.get("reported", 0)
+    problems = sum(final.get(k, 0) for k in ("network_error", "http_error", "auth_error", "unknown_send"))
+    if accepted == 0 and problems > 0:
+        log.error("no reports accepted but %d error(s) occurred; failing so the chain stops",
+                  problems)
+        return 4
     return 0
 
 
