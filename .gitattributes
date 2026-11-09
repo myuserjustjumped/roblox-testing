@@ -1,0 +1,4 @@
+reported.txt merge=union
+attempted.txt merge=union
+users.txt merge=union
+.last_run_end merge=ours
