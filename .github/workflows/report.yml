@@ -18,6 +18,11 @@ env:
   REPORT_MAX_RUNTIME_SECONDS: '17400'
   COOLDOWN_SECONDS: '180'
   STATE_PUSH_INTERVAL: '300'
+  COOKIES_SECRET_NAME: COOKIES_FILE
+  REFRESH_WORKERS: '10'
+  REFRESH_TIMEOUT: '30'
+  REFRESH_RETRIES: '2'
+  REFRESH_MAX_SECONDS: '900'
 
 jobs:
   run:
@@ -39,7 +44,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests PyNaCl
 
       - name: Chain gate
         id: gate
@@ -126,6 +131,7 @@ jobs:
               lines.pop(0)
           while lines and not lines[-1].strip():
               lines.pop()
+
           Path("cookies.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
           PY
           rm -f cookies.raw
@@ -159,6 +165,31 @@ jobs:
               sys.exit(2)
           print(f"parsed {parsed} cookie(s)")
           PY
+
+      - name: Refresh cookies
+        id: refresh
+        if: steps.gate.outputs.proceed == 'true'
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          COOKIES_FILE: ${{ secrets.COOKIES_FILE }}
+          COOKIES_PAT: ${{ secrets.COOKIES_PAT }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${COOKIES_PAT:-}" ]; then
+            echo "::warning::COOKIES_PAT is not set; skipping the cookie refresh"
+            exit 0
+          fi
+
+          rc=0
+          python refresh.py || rc=$?
+
+          echo "refresh_exit=${rc}" >> "$GITHUB_OUTPUT"
+          if [ "${rc}" -ne 0 ]; then
+            echo "::warning::refresh.py exited with code ${rc}; the COOKIES_FILE secret was left as-is"
+            exit "${rc}"
+          fi
 
       - name: Run script
         id: run
@@ -258,6 +289,7 @@ jobs:
                            or .status == \"requested\")]
                     | length"
           )"
+
           if [ "${pending:-0}" -gt 0 ]; then
             echo "a successor is already queued (${pending}); not dispatching another"
             exit 0
