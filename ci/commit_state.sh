@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-MAX_ATTEMPTS="${1:-5}"
-[[ "${MAX_ATTEMPTS}" =~ ^[0-9]+$ ]] || MAX_ATTEMPTS=5
-shift || true
-
+MAX_ATTEMPTS=5
 touch_last_run=0
 for arg in "$@"; do
-  [ "${arg}" = "--touch-last-run" ] && touch_last_run=1
+  if [ "${arg}" = "--touch-last-run" ]; then
+    touch_last_run=1
+  elif [[ "${arg}" =~ ^[0-9]+$ ]] && [ "${arg}" -gt 0 ]; then
+    MAX_ATTEMPTS="${arg}"
+  fi
 done
 
 BRANCH="${BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
@@ -32,7 +33,7 @@ fi
 
 if ! git diff --quiet -- .gitattributes; then
   git add .gitattributes
-  git commit -q -m "chore: add state merge drivers [skip ci]" || true
+  git commit -q -m "chore: add state merge drivers [skip ci]" || exit 1
 fi
 
 add_args=()
@@ -45,11 +46,19 @@ if [ "${#add_args[@]}" -eq 0 ]; then
 fi
 git add -- "${add_args[@]}"
 
-if git diff --staged --quiet; then
-  echo "nothing to commit"
-  exit 0
+if ! git diff --staged --quiet; then
+  git commit -q -m "chore: checkpoint progress [skip ci]" || exit 1
 fi
-git commit -q -m "chore: checkpoint progress [skip ci]"
+
+if git diff --staged --quiet; then
+  if git rev-parse --verify --quiet "origin/${BRANCH}" >/dev/null; then
+    ahead="$(git rev-list --count "origin/${BRANCH}..HEAD" 2>/dev/null || echo 1)"
+    if [ "${ahead}" = "0" ]; then
+      echo "nothing to commit"
+      exit 0
+    fi
+  fi
+fi
 
 for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
   if git push origin "HEAD:${BRANCH}"; then
