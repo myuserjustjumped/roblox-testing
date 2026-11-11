@@ -7,9 +7,10 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 
@@ -20,8 +21,12 @@ DEFAULT_UA = (
 )
 ROBLOSECURITY = "roblosecurity"
 COOKIE_NAME = ".ROBLOSECURITY"
-STAGING_FILE = "cookies.refreshed.txt"
-TOKEN_ENV_NAMES = ("COOKIES_PAT", "SECRETS_PAT", "GH_PAT", "PAT_TOKEN", "GITHUB_TOKEN")
+DEFAULT_COOKIE_FILE = "cookies.txt"
+DEFAULT_API_URL = "https://api.github.com"
+DEFAULT_RAW_URL = "https://raw.githubusercontent.com"
+API_VERSION = "2022-11-28"
+GITHUB_USER_AGENT = "reporter-cookie-refresh/1.0"
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 LEGACY_COOKIE_RE = re.compile(
     r"^(_\|WARNING:-DO-NOT-SHARE-THIS\.--Sharing-this-will-allow-someone-to-log-in-"
@@ -63,17 +68,36 @@ def error(message: str) -> None:
     print(f"::error title=refresh::{message}", flush=True)
 
 
+def netscape_value(stripped: str) -> str | None:
+    body = stripped
+    if body.startswith("#HttpOnly_"):
+        body = body[len("#HttpOnly_"):]
+    parts = body.split("\t")
+    if len(parts) >= 7 and parts[-2].strip().lstrip(".").lower() == ROBLOSECURITY:
+        value = parts[-1].strip()
+        if value:
+            return value
+    return None
+
+
 def extract_cookie_value(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+    value = netscape_value(stripped)
+    if value:
+        return value
+    if stripped.startswith("#"):
+        return None
     for pattern in VALUE_PATTERNS:
-        match = pattern.search(line)
+        match = pattern.search(stripped)
         if match:
             return match.group(1)
-    candidate = line.strip()
+    candidate = stripped
     if (
         candidate
         and len(candidate) >= 20
         and not any(ch.isspace() for ch in candidate)
-        and not candidate.startswith("#")
     ):
         return candidate
     return None
@@ -89,21 +113,14 @@ def load_lines(raw: str) -> list[Line]:
 
     lines: list[Line] = []
     for index, raw_line in enumerate(raw_lines):
-        stripped = raw_line.strip()
-        if not stripped:
-            lines.append(Line(index=index, raw=raw_line, kind="blank"))
-        elif stripped.startswith("#"):
-            lines.append(Line(index=index, raw=raw_line, kind="comment"))
+        value = extract_cookie_value(raw_line)
+        if not raw_line.strip():
+            kind = "blank"
+        elif value:
+            kind = "cookie"
         else:
-            value = extract_cookie_value(stripped)
-            lines.append(
-                Line(
-                    index=index,
-                    raw=raw_line,
-                    value=value,
-                    kind="cookie" if value else "comment",
-                )
-            )
+            kind = "comment"
+        lines.append(Line(index=index, raw=raw_line, value=value, kind=kind))
     return lines
 
 
@@ -118,6 +135,20 @@ def replace_value(line: str, old: str, new: str) -> str:
         flags=re.IGNORECASE,
     )
     return replaced if count else line
+
+
+def apply_rotation(text: str, old: str, new: str) -> str:
+    if not old or not new or old == new:
+        return text
+    output: list[str] = []
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        ending = raw_line[len(line):]
+        if extract_cookie_value(line) == old:
+            output.append(replace_value(line, old, new) + ending)
+        else:
+            output.append(raw_line)
+    return "".join(output)
 
 
 def set_cookie_headers(response) -> list[str]:
@@ -318,77 +349,165 @@ def probe(result: Result, url: str, timeout: float, retries: int) -> Result:
     return result
 
 
-def resolve_token() -> str | None:
-    for name in TOKEN_ENV_NAMES:
-        token = (os.environ.get(name) or "").strip()
-        if token:
-            return token
-    return None
+class GitHubCookieError(Exception):
+    pass
 
 
-def push_secret(
-    name: str, value: str, token: str, repo: str, api: str, attempts: int = 4
-) -> tuple[bool, str]:
-    try:
-        from nacl import encoding, public
-    except ImportError:
-        return False, "PyNaCl is not installed (pip install PyNaCl)"
+class GitHubCookieStore:
+    def __init__(
+        self,
+        repo: str,
+        token: str,
+        ref: str = "main",
+        path: str = DEFAULT_COOKIE_FILE,
+        local_path: str | Path = DEFAULT_COOKIE_FILE,
+        api: str = DEFAULT_API_URL,
+    ) -> None:
+        if not REPO_RE.fullmatch(repo.strip()):
+            raise GitHubCookieError("COOKIES_REPO must be in owner/repo form")
+        if not token.strip():
+            raise GitHubCookieError("COOKIES_PAT is empty or not set")
+        self.repo = repo.strip()
+        self.token = token.strip()
+        self.ref = ref.strip() or "main"
+        self.path = path.strip() or DEFAULT_COOKIE_FILE
+        self.local_path = Path(local_path)
+        self.api = api.rstrip("/")
+        self._lock = threading.RLock()
+        self._session = requests.Session()
+        self._session.trust_env = False
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "reporter-refresh-cookie/1.0",
-    }
-
-    last = ""
-    for attempt in range(1, attempts + 1):
+    def close(self) -> None:
         try:
-            key_response = requests.get(
-                f"{api}/repos/{repo}/actions/secrets/public-key",
-                headers=headers,
+            self._session.close()
+        except Exception:
+            pass
+
+    def _headers(self, accept: str) -> dict:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": accept,
+            "X-GitHub-Api-Version": API_VERSION,
+            "User-Agent": GITHUB_USER_AGENT,
+        }
+
+    def _raw_url(self) -> str:
+        return (
+            f"{DEFAULT_RAW_URL}/{self.repo}/"
+            f"{quote(self.ref, safe='')}/{quote(self.path, safe='')}"
+        )
+
+    def _contents_url(self) -> str:
+        return f"{self.api}/repos/{self.repo}/contents/{quote(self.path, safe='')}"
+
+    def read(self) -> str:
+        last = ""
+        for attempt in range(1, 4):
+            try:
+                response = self._session.get(
+                    self._raw_url(),
+                    headers=self._headers("text/plain"),
+                    timeout=30,
+                    allow_redirects=True,
+                )
+            except requests.RequestException as exc:
+                last = type(exc).__name__
+                if attempt < 3:
+                    time.sleep(min(2 ** attempt, 10))
+                    continue
+                raise GitHubCookieError(f"raw read failed after 3 attempts ({last})") from None
+            if response.status_code == 200:
+                try:
+                    return response.content.decode("utf-8-sig")
+                except UnicodeError:
+                    raise GitHubCookieError("cookies.txt is not valid UTF-8") from None
+            if response.status_code in (401, 403, 404):
+                raise GitHubCookieError(
+                    f"raw read refused (HTTP {response.status_code}); check PAT, repo and ref"
+                )
+            last = f"HTTP {response.status_code}"
+            if attempt < 3:
+                time.sleep(min(2 ** attempt, 10))
+        raise GitHubCookieError(f"raw read failed after 3 attempts ({last})")
+
+    def _metadata(self) -> tuple[str, str | None]:
+        try:
+            response = self._session.get(
+                self._contents_url(),
+                headers=self._headers("application/vnd.github.object+json"),
+                params={"ref": self.ref},
                 timeout=30,
             )
-            if key_response.status_code == 401:
-                return False, "PAT rejected (401); check it exists and has not expired"
-            if key_response.status_code == 403:
-                return False, (
-                    "PAT lacks permission (403); needs a classic PAT with 'repo' scope "
-                    "or a fine-grained PAT with Secrets: write (GITHUB_TOKEN cannot do this)"
-                )
-            if key_response.status_code == 404:
-                return False, f"repo {repo} not found or not visible to the PAT (404)"
-            key_response.raise_for_status()
-            key_data = key_response.json()
+        except requests.RequestException as exc:
+            raise GitHubCookieError(f"contents read failed ({type(exc).__name__})") from None
+        if response.status_code != 200:
+            raise GitHubCookieError(f"contents read refused (HTTP {response.status_code})")
+        try:
+            data = response.json()
+        except ValueError:
+            raise GitHubCookieError("contents read returned invalid JSON") from None
+        if not isinstance(data, dict) or data.get("type") != "file" or not data.get("sha"):
+            raise GitHubCookieError("cookies.txt is not a readable file in the cookie repo")
+        text = None
+        if data.get("encoding") == "base64" and data.get("content"):
+            try:
+                text = base64.b64decode(data["content"]).decode("utf-8-sig")
+            except (ValueError, UnicodeError):
+                raise GitHubCookieError("contents read returned invalid file content") from None
+        return str(data["sha"]), text
 
-            sealed = public.SealedBox(
-                public.PublicKey(key_data["key"].encode(), encoding.Base64Encoder())
-            ).encrypt(value.encode())
-
-            put_response = requests.put(
-                f"{api}/repos/{repo}/actions/secrets/{name}",
-                headers=headers,
-                json={
-                    "encrypted_value": base64.b64encode(sealed).decode(),
-                    "key_id": key_data["key_id"],
-                },
+    def _put(self, text: str, sha: str) -> int:
+        payload = {
+            "message": "chore: update cookies.txt",
+            "content": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+            "sha": sha,
+            "branch": self.ref,
+        }
+        try:
+            response = self._session.put(
+                self._contents_url(),
+                headers=self._headers("application/vnd.github+json"),
+                json=payload,
                 timeout=30,
             )
-            if put_response.status_code in (200, 201, 204):
-                return True, f"secret {name} updated (HTTP {put_response.status_code})"
-            if put_response.status_code in (401, 403, 404):
-                return False, (
-                    f"secret update refused (HTTP {put_response.status_code}): "
-                    f"{put_response.text[:300]}"
-                )
-            last = f"HTTP {put_response.status_code}: {put_response.text[:300]}"
-        except Exception as exc:
-            last = f"{type(exc).__name__}: {exc}"
+        except requests.RequestException as exc:
+            raise GitHubCookieError(f"contents write failed ({type(exc).__name__})") from None
+        return response.status_code
 
-        if attempt < attempts:
-            time.sleep(min(2 ** attempt, 10))
-
-    return False, f"gave up after {attempts} attempts ({last})"
+    def rotate(self, old: str, new: str) -> bool:
+        if not old or not new or old == new:
+            return False
+        with self._lock:
+            last = ""
+            for attempt in range(1, 6):
+                try:
+                    sha, remote_text = self._metadata()
+                    if remote_text is None:
+                        remote_text = self.read()
+                    updated = apply_rotation(remote_text, old, new)
+                    if updated == remote_text:
+                        write_private(self.local_path, remote_text)
+                        return False
+                    status = self._put(updated, sha)
+                    if status in (200, 201):
+                        write_private(self.local_path, updated)
+                        return True
+                    if status in (409, 422):
+                        last = f"HTTP {status}"
+                        if attempt < 5:
+                            time.sleep(min(attempt, 3))
+                            continue
+                    elif status in (401, 403, 404):
+                        raise GitHubCookieError(f"contents write refused (HTTP {status})")
+                    else:
+                        last = f"HTTP {status}"
+                except GitHubCookieError:
+                    raise
+                except requests.RequestException as exc:
+                    last = type(exc).__name__
+                if attempt < 5:
+                    time.sleep(min(2 ** attempt, 10))
+            raise GitHubCookieError(f"cookie update failed after 5 attempts ({last})")
 
 
 def write_private(path: Path, text: str) -> None:
@@ -464,30 +583,49 @@ def env_switch(name: str) -> bool:
 
 
 def main() -> int:
-    source_env = env_text("COOKIES_ENV_NAME", "COOKIES_FILE")
-    output = Path(env_text("REFRESH_TXT", STAGING_FILE))
-    secret_name = env_text("COOKIES_SECRET_NAME", "COOKIES_FILE")
+    repo = env_text("COOKIES_REPO", "")
+    token = env_text("COOKIES_PAT", "")
+    ref = env_text("COOKIES_REF", "main")
+    local = Path(env_text("REFRESH_TXT", env_text("COOKIE_FILE", DEFAULT_COOKIE_FILE)))
     url = env_text("REFRESH_URL", DEFAULT_PROBE_URL)
     workers = max(1, env_number("REFRESH_WORKERS", 10, int))
     timeout = max(1.0, env_number("REFRESH_TIMEOUT", 30.0, float))
     retries = max(0, env_number("REFRESH_RETRIES", 2, int))
     max_seconds = env_number("REFRESH_MAX_SECONDS", 900.0, float)
-    keep_txt = env_switch("REFRESH_KEEP_TXT")
     dry_run = env_switch("REFRESH_DRY_RUN")
 
-    raw_blob = os.environ.get(source_env, "")
-    if not raw_blob.strip():
-        error(f"environment variable {source_env} is empty or not set")
+    missing = []
+    if not token:
+        missing.append("COOKIES_PAT")
+    if not repo:
+        missing.append("COOKIES_REPO")
+    if missing:
+        error("missing " + " and ".join(missing))
         return 2
 
+    try:
+        store = GitHubCookieStore(repo, token, ref, local_path=local)
+    except GitHubCookieError as exc:
+        error(str(exc))
+        return 2
+
+    try:
+        raw_blob = store.read()
+    except GitHubCookieError as exc:
+        error(f"could not read cookies.txt from GitHub: {exc}")
+        store.close()
+        return 2
+
+    write_private(local, raw_blob)
     lines = load_lines(raw_blob)
     cookie_lines = [line for line in lines if line.kind == "cookie"]
     if not cookie_lines:
-        error(f"no cookies found in {source_env}")
+        error("no cookies found in cookies.txt")
+        store.close()
         return 1
 
     log(
-        f"{len(cookie_lines)} cookie(s) from {source_env}; probing {url} "
+        f"{len(cookie_lines)} cookie(s) from {repo}; probing {url} "
         f"with {workers} worker(s)"
     )
 
@@ -495,33 +633,47 @@ def main() -> int:
     global _deadline
     started = time.monotonic()
     _deadline = started + max_seconds if max_seconds > 0 else None
+    exit_code = 0
+    persisted = 0
+    persistence_errors = 0
+
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        list(
-            pool.map(
-                lambda row: run_probe(row, url, timeout, retries), results
-            )
-        )
+        futures = [pool.submit(run_probe, row, url, timeout, retries) for row in results]
+        for future in as_completed(futures):
+            try:
+                row = future.result()
+            except Exception as exc:
+                exit_code = 1
+                warn(f"cookie probe failed ({type(exc).__name__})")
+                continue
+            if row.status != "refreshed" or not row.new_value or dry_run:
+                continue
+            try:
+                changed = store.rotate(row.line.value or "", row.new_value)
+                if changed:
+                    persisted += 1
+                else:
+                    row.note = "remote cookie already changed; no write needed"
+            except GitHubCookieError as exc:
+                exit_code = 1
+                persistence_errors += 1
+                row.status = "error"
+                row.note = f"rotation received but GitHub persistence failed: {exc}"
+                try:
+                    current = local.read_text(encoding="utf-8")
+                    write_private(local, apply_rotation(current, row.line.value or "", row.new_value))
+                except OSError:
+                    pass
+
     elapsed = time.monotonic() - started
-
-    rotated = 0
-    new_lines: list[str] = []
-    by_index = {row.line.index: row for row in results}
-    for line in lines:
-        row = by_index.get(line.index)
-        if row is not None and row.status == "refreshed" and row.new_value:
-            new_lines.append(replace_value(line.raw, line.value or "", row.new_value))
-            rotated += 1
-        else:
-            new_lines.append(line.raw)
-    secret_text = "\n".join(new_lines) + "\n"
-
-    totals = {status: 0 for status in ("refreshed", "unchanged", "invalid", "gated", "skipped", "error")}
+    totals: dict[str, int] = {}
     for row in results:
         totals[row.status] = totals.get(row.status, 0) + 1
     log(
-        f"probe round took {elapsed:.1f}s; rotated {totals['refreshed']}, "
-        f"no-header {totals['unchanged']}, invalid {totals['invalid']}, "
-        f"gated {totals['gated']}, skipped {totals['skipped']}, errors {totals['error']}"
+        f"probe round took {elapsed:.1f}s; persisted {persisted}, "
+        f"no-header {totals.get('unchanged', 0)}, invalid {totals.get('invalid', 0)}, "
+        f"gated {totals.get('gated', 0)}, skipped {totals.get('skipped', 0)}, "
+        f"errors {totals.get('error', 0)}"
     )
 
     for row in results:
@@ -553,57 +705,18 @@ def main() -> int:
               "replace them with freshly minted cookies"
         )
 
-    staging = Path(output)
-    write_private(staging, secret_text)
-    log(f"wrote {staging} ({len(secret_text.splitlines())} line(s))")
-
     extra: list[str] = []
-    exit_code = 0
-
-    if not rotated:
-        log(f"nothing to rotate; {secret_name} left untouched")
-        extra.append(f"- `{secret_name}` unchanged (no rotation header this run)")
-    elif dry_run:
-        log(f"dry run: would push {staging} to secret {secret_name}")
-        extra.append(f"- dry run: {rotated} rotation(s) not pushed")
+    if dry_run:
+        extra.append(f"- dry run: {totals.get('refreshed', 0)} rotation(s) not pushed")
+    elif persisted:
+        extra.append(f"- `cookies.txt` updated via GitHub Contents API ({persisted} persisted)")
+    elif persistence_errors:
+        extra.append("- `cookies.txt` persistence **failed**")
     else:
-        token = resolve_token()
-        repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
-        api = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
-        missing = []
-        if not token:
-            missing.append("a PAT (COOKIES_PAT)")
-        if not repo:
-            missing.append("GITHUB_REPOSITORY")
-        if missing:
-            error("cannot update the secret: missing " + " and ".join(missing))
-            exit_code = 2
-        else:
-            staged_text = staging.read_text(encoding="utf-8")
-            size = len(staged_text.encode())
-            if size > 46000:
-                warn(f"cookie blob is {size} bytes; GitHub's secret limit is 48 KB")
-            ok, message = push_secret(secret_name, staged_text, token, repo, api)
-            if ok:
-                log(message)
-                extra.append(f"- `{secret_name}` updated via REST API ({rotated} rotated)")
-            else:
-                error(f"secret push failed: {message}")
-                extra.append(f"- `{secret_name}` push **failed**: {message}")
-                exit_code = 1
-
-    if keep_txt:
-        log(f"keeping {staging} (REFRESH_KEEP_TXT=1)")
-    else:
-        try:
-            staging.unlink()
-            log(f"deleted {staging}")
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            warn(f"could not delete {staging}: {exc}")
+        extra.append("- `cookies.txt` unchanged (no rotation header this run)")
 
     write_summary(results, extra)
+    store.close()
     return exit_code
 
 
