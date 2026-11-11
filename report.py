@@ -91,6 +91,12 @@ SURFACES = [
 
 log = logging.getLogger("reporter")
 _session_local = threading.local()
+_rotation_listener = None
+
+
+def set_rotation_listener(listener) -> None:
+    global _rotation_listener
+    _rotation_listener = listener
 
 
 def get_session() -> requests.Session:
@@ -149,12 +155,12 @@ def parse_cookie_line(line: str) -> dict | None:
     stripped = line.strip()
     if not stripped:
         return None
-    if stripped.startswith("#HttpOnly_"):
-        parts = stripped[len("#HttpOnly_"):].split("\t")
-        if len(parts) >= 7 and parts[-2].strip() == ".ROBLOSECURITY":
-            value = parts[-1].strip()
-            if value:
-                return {"header": ".ROBLOSECURITY=" + value, "value": value}
+    body = stripped[len("#HttpOnly_"):] if stripped.startswith("#HttpOnly_") else stripped
+    parts = body.split("\t")
+    if len(parts) >= 7 and parts[-2].strip().lstrip(".").lower() == "roblosecurity":
+        value = parts[-1].strip()
+        if value:
+            return {"header": ".ROBLOSECURITY=" + value, "value": value}
         return None
     if stripped.startswith("#"):
         return None
@@ -219,6 +225,7 @@ class Cookie:
         with self._lock:
             if new_value == self.value:
                 return
+            old_value = self.value
             self.value = new_value
             parts = [p.strip() for p in self.header.split(";") if p.strip()]
             out, replaced = [], False
@@ -231,6 +238,15 @@ class Cookie:
             if not replaced:
                 out.append(".ROBLOSECURITY=" + new_value)
             self.header = "; ".join(out)
+        listener = _rotation_listener
+        if listener is not None:
+            try:
+                listener(old_value, new_value)
+            except Exception as exc:
+                log.warning(
+                    "cookie #%d rotation persistence failed (%s)",
+                    self.id, type(exc).__name__,
+                )
 
     def is_invalid(self) -> bool:
         with self._lock:
@@ -347,6 +363,7 @@ def validate_cookie(cookie: Cookie) -> bool:
                               timeout=VALIDATION_TIMEOUT)
     except requests.RequestException:
         return False
+    cookie.update_from_response(r)
     if r.status_code == 429:
         return True
     if r.status_code != 200:
@@ -733,6 +750,20 @@ def main(argv=None) -> int:
     users_file = env_path("USERS_FILE", DEFAULT_USERS_FILE)
     reported_file = env_path("REPORTED_FILE", DEFAULT_REPORTED_FILE)
     attempted_file = env_path("ATTEMPTED_FILE", DEFAULT_ATTEMPTED_FILE)
+
+    if os.environ.get("COOKIES_REPO", "").strip() and os.environ.get("COOKIES_PAT", "").strip():
+        try:
+            from refresh import GitHubCookieStore
+
+            rotation_store = GitHubCookieStore(
+                os.environ["COOKIES_REPO"],
+                os.environ["COOKIES_PAT"],
+                os.environ.get("COOKIES_REF", "main"),
+                local_path=cookie_file,
+            )
+            set_rotation_listener(rotation_store.rotate)
+        except Exception as exc:
+            log.warning("cookie rotation persistence disabled (%s)", type(exc).__name__)
 
     cookies = load_cookies(cookie_file)
     log.info("loaded %d cookie line(s)", len(cookies))
